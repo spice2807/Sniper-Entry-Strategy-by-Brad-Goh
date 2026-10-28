@@ -1,0 +1,654 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © Backtest the Hype
+//
+// ─────────────────────────────────────────────────────────────────────────────
+//  Brad Goh (The Trading Geek) — "How I Combine Liquidity Sweeps, Order Blocks
+//  and FVGs For SNIPER Entries"
+//  coded by Backtest the Hype · v1.1 · spec v3
+//  HOW TO RUN: open a 5-MINUTE chart (EURUSD, NAS100 or XAUUSD), add this script,
+//  pick the TEST VERSION, open the Strategy Tester. Nothing else to change.
+//  The MT5 EA is the real backtest (6 years, real ticks). This is the visual check.
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//  HIS RULES (stated in the video)
+//   1. A break of structure sets the direction and the range.
+//   2. Wait for a liquidity sweep: price runs a swing / equal low (high) and rejects.
+//      No sweep, no trade.
+//   3. Order block = the full high-to-low of the origin candle of the move (range method).
+//   4. Fair value gap = 3-candle gap inside the move, best inside / near the OB.
+//      No FVG -> use the OB.
+//   5. Wait for price to come back. Aggressive = enter on the touch, stop beyond the
+//      FVG / OB. Conservative = wait for a lower-timeframe shift first. Target 2R.
+//      Advanced: stop beyond the entry candle when it swept liquidity.
+//
+//  OUR DEFINITIONS — our mechanical reading, NOT rules he stated (spec v3, section 11)
+//   - Swing = Backtest the Hype qualified swing (2+ candle push, anchor, close-confirmed).
+//     Swing price = extreme of the push. Usable only after its confirming candle closes.
+//   - Direction flips only when price closes beyond the protected low / high of the range.
+//   - Sweep = wick through a swing / equal low inside the range, close back above
+//     within 3 candles. Equal lows = within 0.10 x ATR.
+//   - Displacement = within 12 candles, a candle with body >= 1 x ATR closes beyond the
+//     origin candle. The setup arms one candle later so the FVG can finish forming.
+//   - FVG must overlap the OB or start within 0.5 x ATR of it, min 0.10 x ATR; largest wins.
+//     A zone price already came back to before the order exists is skipped (first touch only).
+//     A sweep only counts once price closes back; a level that is breached is used up.
+//   - V5: the 1H trend must agree when the setup arms AND until the order fills.
+//   - Stop buffer 0.10 x ATR. Setup expires after 48 candles. One trade per setup.
+//   - Orders fill only between 07:00 London and 11:30 New York (real DST).
+//     Max 2 filled trades a day, 1 open trade. Friday close-out 16:50 New York.
+//   - 1% fixed risk on $100,000 (no compounding). 2R target from the actual fill.
+//   - V3 on TradingView enters at the next 5M open after the 1M shift (MT5 uses the
+//     next 1M open). Same-candle stop + target: TradingView's emulator decides; the
+//     panel counts those trades. MT5 real ticks = the reference numbers.
+// ─────────────────────────────────────────────────────────────────────────────
+
+//@version=6
+strategy("Backtest the Hype — Brad Goh Sweep + OB + FVG", shorttitle = "BTH Brad Goh SMC", overlay = true, initial_capital = 100000, currency = currency.USD, default_qty_type = strategy.fixed, default_qty_value = 1, pyramiding = 0, margin_long = 0, margin_short = 0, commission_type = strategy.commission.cash_per_order, commission_value = 0, slippage = 0, max_bars_back = 5000, max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
+
+// ───────────── Test version (the only thing to change) ─────────────
+V1 = "V1 · Order block touch"
+V2 = "V2 · FVG touch (Brad's main)"
+V3 = "V3 · Conservative (1M shift)"
+V4 = "V4 · Advanced stop (entry candle)"
+V5 = "V5 · FVG touch + 1H bias"
+ver = input.string(V2, "TEST VERSION", options = [V1, V2, V3, V4, V5], group = "▶ Pick a version, then run the Strategy Tester", tooltip = "V1 limit at the order block · V2 limit at the FVG (OB if none) · V3 waits for a 1-minute structure shift in the zone · V4 waits for the touch candle to sweep liquidity, stop beyond that candle · V5 = V2, only with the 1-hour trend.")
+vN = ver == V1 ? 1 : ver == V2 ? 2 : ver == V3 ? 3 : ver == V4 ? 4 : 5
+
+// ───────────── Advanced (spec values — leave as is) ─────────────
+gA = "Advanced (spec v3 values — leave as is)"
+riskPct  = input.float(1.0, "Risk per trade (% of starting balance)", minval = 0.1, step = 0.1, group = gA)
+rr       = input.float(2.0, "Target (R)", minval = 0.5, step = 0.25, group = gA)
+maxTr    = input.int(2, "Max filled trades per day", minval = 1, maxval = 10, group = gA)
+reclN    = input.int(3, "Sweep: close back within (candles, breach = 1)", minval = 1, maxval = 10, group = gA)
+dispN    = input.int(12, "Displacement within (candles after the sweep)", minval = 1, maxval = 50, group = gA)
+dispK    = input.float(1.0, "Displacement body >= x ATR", minval = 0.1, step = 0.1, group = gA)
+fvgMinK  = input.float(0.10, "FVG min size (x ATR)", minval = 0, step = 0.05, group = gA)
+fvgNearK = input.float(0.5, "FVG max distance from the OB (x ATR)", minval = 0, step = 0.1, group = gA)
+eqK      = input.float(0.10, "Equal highs / lows tolerance (x ATR)", minval = 0, step = 0.05, group = gA)
+bufK     = input.float(0.10, "Stop buffer (x ATR)", minval = 0, step = 0.05, group = gA)
+expN     = input.int(48, "Setup expires after (5M candles)", minval = 1, maxval = 500, group = gA)
+v3N      = input.int(12, "V3: 1M shift must come within (5M candles of the touch)", minval = 1, maxval = 100, group = gA)
+wStart   = input.int(700, "Entry window start (London time, HHMM)", minval = 0, maxval = 2359, group = gA)
+wEnd     = input.int(1130, "Entry window end (New York time, HHMM)", minval = 0, maxval = 2359, group = gA)
+friClose = input.int(1650, "Friday close-out (New York time, HHMM)", minval = 0, maxval = 2359, group = gA)
+
+gV = "Visuals"
+showZones  = input.bool(true, "Show sweeps and zones", group = gV)
+showTrades = input.bool(true, "Show trades (position-tool boxes)", group = gV)
+showPanel  = input.bool(true, "Show results panel", group = gV)
+
+cGreen = #00E561
+cRed   = #FF4D5E
+cGrey  = #7E918A
+cWhite = #EEF4F0
+cPanel = #0B1410
+cAmber = #F5B942
+
+NY  = "America/New_York"
+LON = "Europe/London"
+isTF = timeframe.period == "5"
+riskCash = strategy.initial_capital * riskPct / 100.0
+
+// ───────────── Time helpers ─────────────
+winStartT(int t) =>
+    timestamp(LON, year(t, NY), month(t, NY), dayofmonth(t, NY), int(math.floor(wStart / 100)), wStart % 100)
+winEndT(int t) =>
+    timestamp(NY, year(t, NY), month(t, NY), dayofmonth(t, NY), int(math.floor(wEnd / 100)), wEnd % 100)
+inWin(int t) =>
+    t >= winStartT(t) and t < winEndT(t)
+
+// broker day = resets 17:00 New York
+bday = dayofmonth(time + 7 * 3600000, NY)
+newBDay = bday != nz(bday[1], -1)
+
+qtyFor(float e, float s) =>
+    float rk = math.abs(e - s) * syminfo.pointvalue
+    rk > 0 ? riskCash / rk : 0.0
+
+// ───────────── Qualified swing (channel standard) ─────────────
+type Swing
+    int   run = 0
+    bool  qual = false
+    bool  anc = false
+    float ancOpen = na
+    float ancClose = na
+    float ext = na
+    int   extI = na
+
+// side = 1 finds swing HIGHS (bullish push, bearish anchor); side = -1 finds swing LOWS.
+// Returns [swing price, bar of the extreme] on the candle that confirms it, else [na, na].
+method step(Swing s, int side, float o, float h, float l, float c, int idx) =>
+    bool pushC = side == 1 ? c > o : c < o
+    bool oppC  = side == 1 ? c < o : c > o
+    float px = side == 1 ? h : l
+    float res = na
+    int resI = na
+    if s.anc
+        if side == 1 ? px > s.ext : px < s.ext
+            s.ext := px
+            s.extI := idx
+        if side == 1 ? c > s.ancOpen : c < s.ancOpen
+            // push resumed: no swing, the next opposite candle becomes the new anchor
+            s.anc := false
+            s.qual := true
+        else if oppC and (side == 1 ? c < s.ancClose : c > s.ancClose)
+            res := s.ext
+            resI := s.extI
+            s.anc := false
+            s.qual := false
+            s.run := 0
+            s.ext := na
+    else
+        if pushC
+            if (s.run == 0 and not s.qual) or na(s.ext) or (side == 1 ? px > s.ext : px < s.ext)
+                s.ext := px
+                s.extI := idx
+            s.run += 1
+            if s.run >= 2
+                s.qual := true
+        else if oppC
+            if s.qual
+                s.anc := true
+                s.ancOpen := o
+                s.ancClose := c
+                if side == 1 ? px > s.ext : px < s.ext
+                    s.ext := px
+                    s.extI := idx
+            else
+                s.run := 0
+                s.ext := na
+    [res, resI]
+
+lowestSince(int idx) =>
+    int n = math.min(math.max(bar_index - idx, 0), 4000)
+    float m = low
+    int mi = bar_index
+    for i = 0 to n
+        if low[i] < m
+            m := low[i]
+            mi := bar_index - i
+    [m, mi]
+
+highestSince(int idx) =>
+    int n = math.min(math.max(bar_index - idx, 0), 4000)
+    float m = high
+    int mi = bar_index
+    for i = 0 to n
+        if high[i] > m
+            m := high[i]
+            mi := bar_index - i
+    [m, mi]
+
+// ───────────── Market structure (direction + protected range) ─────────────
+type Struct
+    Swing hiT
+    Swing loT
+    int   dir = 0
+    float sh = na
+    int   shI = na
+    int   shC = na
+    bool  shB = true
+    float sl = na
+    int   slI = na
+    int   slC = na
+    bool  slB = true
+    float pLo = na
+    int   pLoI = na
+    float pHi = na
+    int   pHiI = na
+    int   bosI = na
+
+// ev: 2 / -2 = direction set or flipped, 1 / -1 = break of structure in the same direction
+method update(Struct s) =>
+    [hp, hpi] = s.hiT.step(1, open, high, low, close, bar_index)
+    [lp, lpi] = s.loT.step(-1, open, high, low, close, bar_index)
+    if not na(hp)
+        s.sh := hp
+        s.shI := hpi
+        s.shC := bar_index
+        s.shB := false
+    if not na(lp)
+        s.sl := lp
+        s.slI := lpi
+        s.slC := bar_index
+        s.slB := false
+    int ev = 0
+    if s.dir == 1 and close < s.pLo
+        [m, mi] = highestSince(s.pLoI)
+        s.dir := -1
+        s.pHi := m
+        s.pHiI := mi
+        s.bosI := bar_index
+        s.slB := true
+        ev := -2
+    else if s.dir == -1 and close > s.pHi
+        [m, mi] = lowestSince(s.pHiI)
+        s.dir := 1
+        s.pLo := m
+        s.pLoI := mi
+        s.bosI := bar_index
+        s.shB := true
+        ev := 2
+    else if s.dir != -1 and not s.shB and (s.dir == 0 or s.shC > s.bosI) and close > s.sh
+        [m, mi] = lowestSince(s.shI)
+        ev := s.dir == 0 ? 2 : 1
+        s.dir := 1
+        s.pLo := m
+        s.pLoI := mi
+        s.bosI := bar_index
+        s.shB := true
+    else if s.dir != 1 and not s.slB and (s.dir == 0 or s.slC > s.bosI) and close < s.sl
+        [m, mi] = highestSince(s.slI)
+        ev := s.dir == 0 ? -2 : -1
+        s.dir := -1
+        s.pHi := m
+        s.pHiI := mi
+        s.bosI := bar_index
+        s.slB := true
+    [ev, lp, hp]
+
+// 1H direction from the same rules, closed 1H candles only (V5)
+htfDirF() =>
+    var Struct h = Struct.new(Swing.new(), Swing.new())
+    [e_, a_, b_] = h.update()
+    h.dir
+htfDir = request.security(syminfo.tickerid, "60", htfDirF()[1], lookahead = barmerge.lookahead_on)
+
+// 1-minute candles inside each 5-minute candle (V3)
+[o1a, h1a, l1a, c1a] = request.security_lower_tf(syminfo.tickerid, "1", [open, high, low, close])
+
+atr = ta.atr(14)
+atrPrev = nz(atr[1], atr)
+
+// ───────────── State ─────────────
+var Struct st = Struct.new(Swing.new(), Swing.new())
+var array<float> liq = array.new<float>()
+
+// sweep sequence: 0 idle · 1 breached, waiting for the close back · 2 waiting for displacement · 3 arm next close
+var int   sq = 0
+var int   qD = 0
+var float qLvl = na
+var int   qB = na
+var int   qC = na
+var float qX = na
+var float oH = na
+var float oL = na
+var int   oI = na
+
+// armed setup
+var int   sDir = 0
+var int   sMode = 0
+var float sLim = na
+var float sStop = na
+var float sZTop = na
+var float sZBot = na
+var float sBuf = na
+var int   sArm = na
+var bool  sTouched = false
+var int   sTouchI = na
+var float sTX = na
+var Swing m1 = Swing.new()
+var float m1Lvl = na
+var box   zB = na
+
+// trades + stats
+var float tStop = na
+var int   tradesToday = 0
+var int   totPrev = 0
+var int   doneN = 0
+var int   nDays = 0
+var int   firstT = na
+var int   nSweeps = 0
+var int   nArmed = 0
+var int   nT = 0
+var int   nW = 0
+var float sumR = 0.0
+var float grossW = 0.0
+var float grossL = 0.0
+var float eqR = 0.0
+var float peakR = 0.0
+var float maxDD = 0.0
+var int   consec = 0
+var int   maxConsec = 0
+var int   nSame = 0
+var box   liveR = na
+var box   liveG = na
+
+if na(firstT)
+    firstT := time
+if newBDay
+    tradesToday := 0
+    nDays += 1
+
+// ───────────── A. Fills and open-trade exits ─────────────
+int totNow = strategy.closedtrades + strategy.opentrades
+if totNow > totPrev
+    tradesToday += totNow - totPrev
+    sDir := 0          // the setup that filled is used up
+    zB := na
+totPrev := totNow
+
+if strategy.position_size != 0
+    float ep = strategy.position_avg_price
+    int pd = strategy.position_size > 0 ? 1 : -1
+    float tp = ep + pd * rr * math.abs(ep - tStop)   // 2R from the actual fill
+    strategy.exit("XL", "BTH", stop = tStop, limit = tp)
+    strategy.exit("XM", "BTHM", stop = tStop, limit = tp)
+    if showTrades
+        int eb = strategy.opentrades.entry_bar_index(0)
+        if na(liveR)
+            liveR := box.new(eb, pd == 1 ? ep : tStop, bar_index, pd == 1 ? tStop : ep, border_color = color.new(cRed, 30), bgcolor = color.new(cRed, 78))
+            liveG := box.new(eb, pd == 1 ? tp : ep, bar_index, pd == 1 ? ep : tp, border_color = color.new(cGreen, 30), bgcolor = color.new(cGreen, 78))
+        else
+            box.set_right(liveR, bar_index)
+            box.set_right(liveG, bar_index)
+
+// ───────────── B. Structure ─────────────
+float prevSL = st.sl
+float prevSH = st.sh
+[ev, newSL, newSH] = st.update()
+int dir = st.dir
+if ev != 0
+    liq.clear()             // new range: old liquidity no longer counts
+if math.abs(ev) == 2
+    sq := 0
+
+// ───────────── C. Armed setup: invalidation, expiry, V3 / V4 triggers ─────────────
+bool flat = strategy.position_size == 0
+bool canTrade = isTF and flat and tradesToday < maxTr and inWin(time_close)
+
+if sDir != 0
+    bool kill = false
+    float zStop = sDir == 1 ? sZBot - sBuf : sZTop + sBuf
+    if sDir != dir
+        kill := true
+    else if vN == 5 and htfDir != sDir     // V5: 1H trend must still agree until the fill
+        kill := true
+    else if sDir == 1 ? close < zStop : close > zStop
+        kill := true
+    else if bar_index - sArm >= expN
+        kill := true
+    else if time_close >= winEndT(time_close)
+        kill := true
+    else if sMode == 4 and flat and bar_index > sArm
+        bool touch = sDir == 1 ? low <= sZTop : high >= sZBot
+        if touch
+            bool swept = sDir == 1 ? (not na(prevSL) and low < prevSL and close > prevSL) : (not na(prevSH) and high > prevSH and close < prevSH)
+            if swept and canTrade
+                float stp = math.round_to_mintick(sDir == 1 ? low - sBuf : high + sBuf)
+                tStop := stp
+                strategy.entry("BTHM", sDir == 1 ? strategy.long : strategy.short, qty = qtyFor(close, stp), comment = str.tostring(stp, format.mintick))
+                strategy.exit("XM", "BTHM", stop = stp, limit = close + sDir * rr * math.abs(close - stp))
+            kill := true    // one touch: trade it or drop it
+    else if sMode == 3 and flat and bar_index > sArm
+        bool trig = false
+        bool dead = false
+        float trigStop = na
+        int n1 = array.size(c1a)
+        if n1 > 0
+            for j = 0 to n1 - 1
+                float o_ = array.get(o1a, j)
+                float h_ = array.get(h1a, j)
+                float l_ = array.get(l1a, j)
+                float c_ = array.get(c1a, j)
+                if not sTouched and (sDir == 1 ? l_ <= sZTop : h_ >= sZBot)
+                    sTouched := true
+                    sTouchI := bar_index
+                    sTX := sDir == 1 ? l_ : h_
+                    m1 := Swing.new()
+                    m1Lvl := na
+                if sTouched
+                    sTX := sDir == 1 ? math.min(sTX, l_) : math.max(sTX, h_)
+                    if not na(m1Lvl) and (sDir == 1 ? c_ > m1Lvl : c_ < m1Lvl)
+                        trig := true
+                        trigStop := sDir == 1 ? sTX - sBuf : sTX + sBuf
+                        break
+                    if sDir == 1 ? c_ < zStop : c_ > zStop
+                        dead := true
+                        break
+                    [p1, pi1] = m1.step(sDir, o_, h_, l_, c_, j)
+                    if not na(p1)
+                        m1Lvl := p1
+        if trig
+            if canTrade
+                float stp = math.round_to_mintick(trigStop)
+                tStop := stp
+                strategy.entry("BTHM", sDir == 1 ? strategy.long : strategy.short, qty = qtyFor(close, stp), comment = str.tostring(stp, format.mintick))
+                strategy.exit("XM", "BTHM", stop = stp, limit = close + sDir * rr * math.abs(close - stp))
+            kill := true
+        else if dead
+            kill := true
+        else if sTouched and bar_index - sTouchI >= v3N
+            kill := true
+    if kill
+        sDir := 0
+        zB := na
+
+// ───────────── D. Sweep → displacement → arm ─────────────
+if sq != 0 and qD != dir
+    sq := 0
+
+bool isBull = close > open
+bool isBear = close < open
+bool armNow = false
+
+if sq == 3
+    armNow := true          // candle after the displacement has closed: FVGs are final
+    sq := 0
+else if sq == 2
+    bool dispOK = (qD == 1 ? isBull and close > oH : isBear and close < oL) and math.abs(close - open) >= dispK * atrPrev
+    if dispOK
+        sq := 3
+    else
+        qX := qD == 1 ? math.min(qX, low) : math.max(qX, high)
+        if qD == 1 ? isBear : isBull
+            oH := high
+            oL := low
+            oI := bar_index
+        if bar_index - qC >= dispN
+            sq := 0
+else if sq == 1
+    qX := qD == 1 ? math.min(qX, low) : math.max(qX, high)
+    if qD == 1 ? isBear : isBull
+        oH := high
+        oL := low
+        oI := bar_index
+    if qD == 1 ? close > qLvl : close < qLvl
+        sq := 2
+        qC := bar_index
+        nSweeps += 1
+        if showZones
+            label.new(bar_index, qX, "sweep", style = qD == 1 ? label.style_label_up : label.style_label_down, color = color.new(cAmber, 20), textcolor = color.black, size = size.tiny)
+    else if bar_index - qB >= reclN - 1
+        sq := 0
+
+// new sweep of liquidity inside the range
+if sq == 0 and dir != 0 and liq.size() > 0
+    float deep = na
+    for k = liq.size() - 1 to 0
+        float lv = liq.get(k)
+        if dir == 1 ? low < lv : high > lv
+            deep := na(deep) ? lv : dir == 1 ? math.min(deep, lv) : math.max(deep, lv)
+            liq.remove(k)
+    if not na(deep)
+        sq := 1
+        qD := dir
+        qLvl := deep
+        qB := bar_index
+        qX := dir == 1 ? low : high
+        oH := high
+        oL := low
+        oI := bar_index
+        if dir == 1 ? close > deep : close < deep
+            sq := 2
+            qC := bar_index
+            nSweeps += 1
+            if showZones
+                label.new(bar_index, qX, "sweep", style = dir == 1 ? label.style_label_up : label.style_label_down, color = color.new(cAmber, 20), textcolor = color.black, size = size.tiny)
+
+// new swing inside the range = liquidity (equal ones merged)
+float newLiq = dir == 1 and not na(newSL) and newSL > st.pLo and bar_index > st.bosI ? newSL : dir == -1 and not na(newSH) and newSH < st.pHi and bar_index > st.bosI ? newSH : na
+if not na(newLiq)
+    bool merged = false
+    if liq.size() > 0
+        for k = 0 to liq.size() - 1
+            if math.abs(liq.get(k) - newLiq) <= eqK * atr
+                liq.set(k, dir == 1 ? math.min(liq.get(k), newLiq) : math.max(liq.get(k), newLiq))
+                merged := true
+                break
+    if not merged
+        liq.push(newLiq)
+
+if armNow
+    float aAtr = atr
+    float buf = bufK * aAtr
+    float fTop = na
+    float fBot = na
+    float fSize = 0.0
+    int fI = na
+    int span = bar_index - oI
+    if span >= 2
+        for k = 0 to span - 2
+            if qD == 1 and high[k + 2] < low[k]
+                float bot = high[k + 2]
+                float top = low[k]
+                bool hit = false     // already revisited before the order exists = not a first touch
+                if k > 0
+                    for m = 0 to k - 1
+                        if low[m] <= top
+                            hit := true
+                            break
+                if not hit and top - bot >= fvgMinK * aAtr and bot <= oH + fvgNearK * aAtr and top > oL and top - bot > fSize
+                    fTop := top
+                    fBot := bot
+                    fSize := top - bot
+                    fI := bar_index - k - 2
+            if qD == -1 and low[k + 2] > high[k]
+                float top = low[k + 2]
+                float bot = high[k]
+                bool hit = false
+                if k > 0
+                    for m = 0 to k - 1
+                        if high[m] >= bot
+                            hit := true
+                            break
+                if not hit and top - bot >= fvgMinK * aAtr and top >= oL - fvgNearK * aAtr and bot < oH and top - bot > fSize
+                    fTop := top
+                    fBot := bot
+                    fSize := top - bot
+                    fI := bar_index - k - 2
+    bool useOB = vN == 1 or na(fTop)
+    float zTop = useOB ? oH : fTop
+    float zBot = useOB ? oL : fBot
+    float lim = math.round_to_mintick(qD == 1 ? zTop : zBot)
+    float stp = math.round_to_mintick(qD == 1 ? zBot - buf : zTop + buf)
+    bool obHit = useOB and (qD == 1 ? low <= oH : high >= oL)   // OB already revisited by the arming candle
+    bool valid = not obHit and (qD == 1 ? close > stp : close < stp) and math.abs(lim - stp) > syminfo.mintick and (vN != 5 or htfDir == qD)
+    if valid
+        nArmed += 1
+        if not na(zB)
+            box.set_right(zB, bar_index)
+        sDir := qD
+        sMode := vN == 3 ? 3 : vN == 4 ? 4 : 1
+        sLim := lim
+        sStop := stp
+        sZTop := zTop
+        sZBot := zBot
+        sBuf := buf
+        sArm := bar_index
+        sTouched := false
+        sTouchI := na
+        zB := showZones ? box.new(useOB ? oI : fI, zTop, bar_index + 1, zBot, border_color = color.new(useOB ? cGrey : cAmber, 50), bgcolor = color.new(useOB ? cGrey : cAmber, 85), text = useOB ? "OB" : "FVG", text_size = size.tiny, text_color = useOB ? cGrey : cAmber, text_halign = text.align_left) : na
+
+if sDir != 0 and not na(zB)
+    box.set_right(zB, bar_index + 1)
+
+// ───────────── E. Resting limit order for V1 / V2 / V5 ─────────────
+bool okLim = sDir != 0 and sMode == 1 and isTF and strategy.position_size == 0 and tradesToday < maxTr and inWin(time_close)
+if okLim
+    tStop := sStop
+    strategy.entry("BTH", sDir == 1 ? strategy.long : strategy.short, qty = qtyFor(sLim, sStop), limit = sLim, comment = str.tostring(sStop, format.mintick))
+    strategy.exit("XL", "BTH", stop = sStop, limit = sLim + sDir * rr * math.abs(sLim - sStop))
+else
+    strategy.cancel("BTH")
+
+// ───────────── F. Friday close-out ─────────────
+if strategy.position_size != 0 and dayofweek(time_close, NY) == dayofweek.friday and hour(time_close, NY) * 100 + minute(time_close, NY) >= friClose
+    strategy.close_all(comment = "Friday close")
+
+// ───────────── G. Closed trades → R stats + boxes ─────────────
+if strategy.closedtrades > doneN
+    if not na(liveR)
+        box.delete(liveR)
+        box.delete(liveG)
+        liveR := na
+        liveG := na
+    for i = doneN to strategy.closedtrades - 1
+        float e = strategy.closedtrades.entry_price(i)
+        float x = strategy.closedtrades.exit_price(i)
+        int td = strategy.closedtrades.size(i) > 0 ? 1 : -1
+        float stp = str.tonumber(strategy.closedtrades.entry_comment(i))
+        float rk = math.abs(e - stp)
+        float r = rk > 0 ? td * (x - e) / rk : 0.0
+        float tp = e + td * rr * rk
+        int eb = strategy.closedtrades.entry_bar_index(i)
+        int xb = strategy.closedtrades.exit_bar_index(i)
+        int off = bar_index - xb
+        if td == 1 ? high[off] >= tp and low[off] <= stp : low[off] <= tp and high[off] >= stp
+            nSame += 1
+        nT += 1
+        sumR += r
+        eqR += r
+        peakR := math.max(peakR, eqR)
+        maxDD := math.max(maxDD, peakR - eqR)
+        if r > 0
+            nW += 1
+            grossW += r
+            consec := 0
+        else
+            grossL += -r
+            consec += 1
+            maxConsec := math.max(maxConsec, consec)
+        if showTrades
+            box.new(eb, td == 1 ? e : stp, xb, td == 1 ? stp : e, border_color = color.new(cRed, 30), bgcolor = color.new(cRed, 78))
+            box.new(eb, td == 1 ? tp : e, xb, td == 1 ? e : tp, border_color = color.new(cGreen, 30), bgcolor = color.new(cGreen, 78))
+            label.new(xb, td == 1 ? math.max(x, tp) : math.min(x, tp), (r >= 0 ? "+" : "") + str.tostring(r, "#.##") + "R", style = td == 1 ? label.style_label_down : label.style_label_up, color = color.new(r > 0 ? cGreen : cRed, 15), textcolor = color.black, size = size.tiny)
+    doneN := strategy.closedtrades
+
+// ───────────── Results panel ─────────────
+var table pnl = table.new(position.top_right, 2, 16, bgcolor = color.new(cPanel, 8), border_color = color.new(cGrey, 60), border_width = 1)
+if showPanel and barstate.islast
+    wr = nT > 0 ? 100.0 * nW / nT : 0.0
+    pf = grossL > 0 ? grossW / grossL : na
+    table.cell(pnl, 0, 0, "BTH · Brad Goh SMC", text_color = cGreen, text_size = size.small)
+    table.cell(pnl, 1, 0, isTF ? "5M ✓" : "SWITCH TO 5-MINUTE CHART", text_color = isTF ? cGreen : cRed, text_size = size.small)
+    table.cell(pnl, 0, 1, "Test version", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 1, ver, text_color = cAmber, text_size = size.small)
+    table.cell(pnl, 0, 2, "Entry window · risk · target", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 2, "07:00 London → 11:30 NY · " + str.tostring(riskPct) + "% · " + str.tostring(rr) + "R", text_color = cAmber, text_size = size.small)
+    table.cell(pnl, 0, 3, "LOADED HISTORY", text_color = cGreen, text_size = size.small)
+    table.cell(pnl, 1, 3, str.format_time(firstT, "dd MMM yyyy", NY) + " · " + str.tostring(nDays) + " days", text_color = nDays < 20 ? cRed : cWhite, text_size = size.small)
+    table.cell(pnl, 0, 4, "Sweeps · setups armed", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 4, str.tostring(nSweeps) + " · " + str.tostring(nArmed), text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 5, "Trades", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 5, str.tostring(nT), text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 6, "Win rate", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 6, str.tostring(wr, "#.#") + "%", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 7, "Total (R)", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 7, str.tostring(sumR, "#.##") + "R", text_color = sumR >= 0 ? cGreen : cRed, text_size = size.small)
+    table.cell(pnl, 0, 8, "Average per trade", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 8, nT > 0 ? str.tostring(sumR / nT, "#.###") + "R" : "—", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 9, "Profit factor", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 9, na(pf) ? "—" : str.tostring(pf, "#.##"), text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 10, "Max drawdown (R)", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 10, str.tostring(maxDD, "#.##") + "R", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 11, "Worst losing streak", text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 1, 11, str.tostring(maxConsec), text_color = cWhite, text_size = size.small)
+    table.cell(pnl, 0, 12, "Same-candle stop + target", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 1, 12, str.tostring(nSame) + " (TradingView picks the order)", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 0, 13, "1H bias now", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 1, 13, vN == 5 ? (htfDir == 1 ? "bullish" : htfDir == -1 ? "bearish" : "none yet") : "not used", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 0, 14, "Costs", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 1, 14, "none here · MT5 = real spread + commission", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 0, 15, "coded by Backtest the Hype", text_color = cGrey, text_size = size.tiny)
+    table.cell(pnl, 1, 15, "MT5 EA = final numbers", text_color = cGrey, text_size = size.tiny)
